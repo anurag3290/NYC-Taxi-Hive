@@ -1,0 +1,278 @@
+drop table taxi_test;
+-- Creating External table taxi 
+-- s3a://anurag-iiitb/taxinyc/ have both the files for Nov and Dec
+create external table if not exists taxi_test(
+	VendorID string, 
+	tpep_pickup_datetime string, 
+	tpep_dropoff_datetime string, 
+	Passenger_count bigint,
+	Trip_distance double, 
+	RateCodeID string, 
+	Store_and_fwd_flag string,
+	pulocationid bigint, 
+	dolocationid bigint, 
+	Payment_type string, 
+	Fare_amount double,
+	Extra double,
+	MTA_tax double,
+	Tip_amount double,
+	Tolls_amount double,
+	Improvement_surcharge double,
+	Total_amount double) 
+ROW FORMAT SERDE 
+	'org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe' 
+	WITH SERDEPROPERTIES ( 
+	  'colelction.delim'='', 
+	  'field.delim'=',', 
+	  'mapkey.delim'='', 
+	  'serialization.format'=',') 
+STORED AS INPUTFORMAT 
+  	'org.apache.hadoop.mapred.TextInputFormat' 
+OUTPUTFORMAT 
+  	'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
+LOCATION
+  	's3a://anurag-iiitb/taxinyc/'
+TBLPROPERTIES (
+  	'skip.header.line.count'='2')
+
+-- Setting partition and disabling Tez
+SET hive.exec.dynamic.partition = true;
+SET hive.exec.dynamic.partition.mode = nonstrict;
+SET hive.execution.engine=mr;
+
+-- Total records
+SELECT count(*) FROM taxi_test
+-- 18793079
+select * from taxi_test LIMIT 10;
+
+-- ###########################
+-- Basic Data Quality Checks
+-- ###########################
+-- ##1 . How many records has each TPEP provider provided? Write a query that summarises the number of records of each provider.
+SELECT VendorID as TPEP, count(*) as no_of_records FROM taxi_test GROUP BY VendorID;
+-- 1 (Creative Mobile Technologies) - 8447149 & 2 (VeriFone Inc.) - 10345930
+
+-- ##2. The data provided is for months November and December only. Check whether the data is consistent, and if not, identify the data quality issues. Mention all data quality issues in comments.
+SELECT count(*) FROM taxi_test WHERE 
+	(MONTH(tpep_pickup_datetime) != 12 AND MONTH(tpep_pickup_datetime) != 11) Or 
+	((MONTH(tpep_pickup_datetime) = 12 Or MONTH(tpep_pickup_datetime) = 11) AND YEAR(tpep_pickup_datetime) != 2017)
+-- 315 records are there which are neither from December nor November month OR are from different year
+-- These records are ffrom Vendor 2 (VeriFone Inc.)
+select VendorID ,count(*) from taxi_test where (unix_timestamp(tpep_pickup_datetime) > unix_timestamp(tpep_dropoff_datetime)) group by VendorID;
+-- 1419 records, All provided by Vendor - 1: Creative Mobile Technologies have unix_timestamp for pickup datetime is greater than dropoff datetime which is wrong
+
+
+##3. You might have encountered unusual or erroneous rows in the dataset. Can you conclude which vendor is doing a bad job in providing the records?
+SELECT vendorid,passenger_count,count(*) FROM taxi_test GROUP BY passenger_count,vendorid 
+-- For 1 record from Vendor 2 (VeriFone Inc.) there are 192 count which is wrong.
+-- The errorneous records are very less in number. We can remove the records or can create a new table excluding that reocrds
+-- #Tip amount is also negative in many cases
+SELECT vendorid,count(*) from taxi_test WHERE Tip_amount<0 GROUP BY vendorid;
+-- There 97 records which have tip amount < 0. Records are very less in number nd can be removed. These records are provided by Vendor -2 (VeriFone Inc.) 
+-- Similarly Fare amount, total amount is also negative for 9372 records
+SELECT vendorid,count(*) from taxi_test WHERE fare_amount<0 GROUP BY vendorid;
+SELECT vendorid,count(*) from taxi_test WHERE Total_amount<0 GROUP BY vendorid;
+-- We can filter out these records too as these are small in number. These records are provided by Vendor -2 (VeriFone Inc.) 
+-- Similarly extra field is also having negative amount
+SELECT vendorid,count(*) from taxi_test WHERE extra<0 GROUP BY vendorid;
+-- 9 records from Vendor-1 and 4826 records from Vendor-2 shows negative extra amount which wrong and should be filtered out.
+-- Similarly Tolls_amount is also negative for a very few records
+SELECT vendorid,count(*) from taxi_test WHERE Tolls_amount<0 GROUP BY vendorid;
+-- 41 records from Vendor-2 shows negative value
+-- Similarly Improvement_surcharge is also negative for few records
+SELECT vendorid,count(*) from taxi_test WHERE Improvement_surcharge<0 GROUP BY vendorid;
+-- 9367 records from Vendor-2 shows negative value
+SELECT vendorid,count(*) from taxi_test WHERE MTA_tax<0 GROUP BY vendorid;
+-- 9092 records shows negative values for mta tax. All be vendor id 2
+
+-- It is also clearly visible that Vendor -2(VeriFone Inc.) is doing a bad job in providing the records
+
+
+-- ## Creating a new table with all filtered values
+-- Creating a new folder as taxi_partition
+-- Creating table with partition on 1. Vendor 2. Passneger Count
+-- Storing the table in ORC format
+create external table if not exists taxi(
+	tpep_pickup_datetime string, 
+	tpep_dropoff_datetime string, 
+	Trip_distance double, 
+	RateCodeID string, 
+	Store_and_fwd_flag string,
+	pulocationid bigint, 
+	dolocationid bigint, 
+	Payment_type string, 
+	Fare_amount double,
+	Extra double,
+	MTA_tax double,
+	Tip_amount double,
+	Tolls_amount double,
+	Improvement_surcharge double,
+	Total_amount double) 
+PARTITIONED BY (VendorID string, Passenger_count bigint)
+stored as orc
+LOCATION 's3a://anurag-iiitb/taxi_partition/'
+tblproperties ("orc.compress"="SNAPPY");
+-- Setting the environment
+SET hive.exec.dynamic.partition = true;
+SET hive.exec.dynamic.partition.mode = nonstrict;
+set hive.exec.max.dynamic.partitions=1000;
+set hive.exec.max.dynamic.partitions.pernode=1000;
+SET hive.mapred.mode = nonstrict;
+SET map.reduce.tasks = 12;
+SET hive.execution.engine=mr;
+-- INserting Values from table taxi_test with filtered values
+insert overwrite table taxi partition(VendorID, Passenger_count)
+select  tpep_pickup_datetime, tpep_dropoff_datetime, Trip_distance, RateCodeID, Store_and_fwd_flag, pulocationid, dolocationid, Payment_type, Fare_amount, Extra, MTA_tax, Tip_amount, Tolls_amount, Improvement_surcharge, Total_amount, VendorID as VendorID, Passenger_count as Passenger_count
+from taxi_test where
+	(vendorid != '') AND 
+	(Tip_amount >= 0) AND
+	(fare_amount >= 0) AND 
+	(Total_amount >= 0) AND 
+	(Tolls_amount >= 0) AND 
+	(MTA_tax >= 0) AND 
+	(Improvement_surcharge >= 0) AND 
+	(extra >= 0) AND 
+	((MONTH(tpep_pickup_datetime) = 12 Or MONTH(tpep_pickup_datetime) = 11) AND YEAR(tpep_pickup_datetime) = 2017) AND
+	(passenger_count < 10) AND
+	(unix_timestamp(tpep_pickup_datetime) <= unix_timestamp(tpep_dropoff_datetime))
+
+-- We can also use direct table formation using below command:
+-- create table taxi as select * from taxi_test where (vendorid != '') AND 
+-- 	(Tip_amount >= 0) AND
+-- 	(fare_amount >= 0) AND 
+-- 	(Total_amount >= 0) AND 
+-- 	(Tolls_amount >= 0) AND 
+-- 	(MTA_tax >= 0) AND 
+-- 	(Improvement_surcharge >= 0) AND 
+-- 	(extra >= 0) AND 
+-- 	((MONTH(tpep_pickup_datetime) = 12 Or MONTH(tpep_pickup_datetime) = 11) AND YEAR(tpep_pickup_datetime) = 2017) AND
+-- 	(passenger_count < 10) AND
+-- 	(unix_timestamp(tpep_pickup_datetime) <= unix_timestamp(tpep_dropoff_datetime))
+
+-- ###########################
+-- Analysis-I
+-- ###########################
+SELECT count(*) FROM taxi
+-- 18781963
+
+-- ##1. Compare the average fare for November and December.
+SELECT  MONTH(tpep_pickup_datetime) as Mnth, avg(fare_amount) FROM taxi WHERE 
+((MONTH(tpep_pickup_datetime) = 11 Or MONTH(tpep_pickup_datetime) = 12) AND YEAR(tpep_pickup_datetime) = 2017) GROUP BY MONTH(tpep_pickup_datetime);
+-- For Nov : 13.149082945652086 and For Dec : 12.946551873708316
+
+-- ##2. Explore the ‘number of passengers per trip’ - how many trips are made by each level of ‘Passenger_count’? Do most people travel solo or with other people?
+SELECT passenger_count,count(*) as cnt FROM taxi GROUP BY passenger_count SORT BY cnt
+-- Single ridership count is 13244318. Yes, it is maximum and most people travel solo
+
+-- ##3. Which is the most preferred mode of payment?
+SELECT payment_type,count(*) as cnt FROM taxi GROUP BY payment_type SORT BY cnt
+-- Most preferred mode of payment is '1' i.e. Credit card having count (12637473)
+
+-- ##4. What is the average tip paid? Compare the average tip with the 25th, 50th and 75th percentiles and comment whether the ‘average tip’ is a representative statistic (of the central tendency) of ‘tip amount paid’.
+SELECT avg(tip_amount) from taxi;
+-- Average tip amount is 1.85
+SELECT percentile_approx( tip_amount,array(0.25,0.5,0.75)) from taxi;
+-- Average Tip for 25th percentile is 0.0
+-- Average Tip for 50th percentile is 1.36
+-- Average Tip for 75th percentile is 2.45
+-- the average tip amount lies between the 2nd and third quartile and very close to 50th percentile. We can say it is a good represnetative statistic of ‘tip amount paid’.
+
+-- ##5. Explore the ‘Extra’ (charge) variable - what is the fraction of total trips where an extra charge is levied?
+SELECT count(*) from taxi WHERE extra = 0 
+-- 10105047 trips charge no extra amount
+SELECT count(*) from taxi WHERE extra > 0 
+-- 8676916 trips levied extra charge 
+-- To allow cartesian product, we should make mapred.mode to nonstrict using below command
+set hive.mapred.mode=nonstrict
+SELECT extra/tot FROM 
+(SELECT count(*) as extra from taxi WHERE extra > 0) t1,
+(SELECT count(*) as tot from taxi) t2
+-- And It is approx 0.46 fraction of the total trips
+
+-- ###########################
+-- Analysis-II
+-- ###########################
+-- ##1. What is the correlation between the number of passengers and tip paid? Do multiple travellers pay more compared to solo travellers?
+SELECT corr(passenger_count,tip_amount) FROM taxi;
+-- Overall the two are not correlaed (-0.003) Or we can say very slightly negatively correlated. 
+SELECT passenger_count, avg(tip_amount) as avg_tip FROM taxi GROUP BY passenger_count SORT BY avg_tip;
+-- However, the average tip_amount is higher than usual when passenger count is greter than 6
+-- But records for passenger count greter than 6 are very less in number and could be errornous. So we can ignore
+
+-- ##2. Create five buckets of ‘tip paid’: [0-5), [5-10), [10-15) , [15-20) and >=20. Calculate the percentage share of each bucket (i.e. the fraction of trips falling in each bucket).
+-- Adding a column name tip_window in the table based on the conditio mentioned above for tip amount
+ALTER TABLE taxi ADD COLUMNS (tip_window string);
+INSERT OVERWRITE TABLE taxi 
+select VendorID, tpep_pickup_datetime, tpep_dropoff_datetime, Passenger_count, Trip_distance, RateCodeID, Store_and_fwd_flag, pulocationid, dolocationid, Payment_type, Fare_amount, Extra, MTA_tax, Tip_amount, Tolls_amount, Improvement_surcharge, Total_amount,
+CASE 
+	WHEN (Tip_amount >= 0 AND Tip_amount < 5) THEN '0-5' 
+	WHEN (Tip_amount >= 5 AND Tip_amount < 10) THEN '5-10' 
+	WHEN (Tip_amount >= 10 AND Tip_amount < 15) THEN '10-15' 
+	WHEN (Tip_amount >= 15 AND Tip_amount < 20) THEN '15-20' 
+	else '>20'
+END AS tip_window from taxi
+where tip_amount>=0
+--Creating a table taxi_bucket in folder(taxi_bucket) for bucketing as taxi_bucket using tip_window column created above
+create external table if not exists taxi_bucket
+(
+	VendorID string, 
+	tpep_pickup_datetime string, 
+	tpep_dropoff_datetime string, 
+	Passenger_count bigint,
+	Trip_distance double, 
+	RateCodeID string, 
+	Store_and_fwd_flag string,
+	pulocationid bigint, 
+	dolocationid bigint, 
+	Payment_type string, 
+	Fare_amount double,
+	Extra double,
+	MTA_tax double,
+	Tip_amount double,
+	Tolls_amount double,
+	Improvement_surcharge double,
+	Total_amount double,
+	tip_window string
+) 
+clustered by (tip_window) into 5 buckets
+location 's3://anurag-iiitb/taxi_bucket/';
+--Restricting Reduce shuffling
+set mapreduce.reduce.shuffle.memory.limit.percent=0.15;
+--Inserting rows to taxi_bucket from taxi
+insert overwrite table taxi_bucket select * from taxi;
+--Percentage share for each bucket
+set hive.mapred.mode=nonstrict
+SELECT tip, (cnt/tot)*100 FROM 
+(SELECT count(*) as cnt, tip_window as tip from taxi_bucket group by tip_window) t1,
+(SELECT count(*) as tot from taxi_bucket) t2
+SORT BY tip
+-- 1	0-5		92.13803690274547
+-- 2	10-15	1.8817788108729634
+-- 3	15-20	0.24026242624373184
+-- 4	5-10	5.635177750057329
+-- 5	>20		0.10474411008050649
+
+-- ##3. Which month has a greater average ‘speed’ - November or December? Note that the variable ‘speed’ will have to be derived from other metrics.
+SELECT MONTH(tpep_pickup_datetime), avg(trip_distance/((unix_timestamp(tpep_dropoff_datetime) - unix_timestamp(tpep_pickup_datetime))/60))  
+from taxi 
+where ((unix_timestamp(tpep_dropoff_datetime) - unix_timestamp(tpep_pickup_datetime))/60) > 0 
+group by MONTH(tpep_pickup_datetime)
+-- Average Speed : For Nov - 0.213 miles/min & For Dec : 0.212 miles/min
+-- Both months have almost same average speed. although Nov have very slightly more avg speed than of Dec
+
+-- ##4. Analyse the average speed of the most happening days of the year i.e. 31st December (New year’s eve) and 25th December (Christmas Eve) and compare it with the overall average. 
+SELECT to_date(tpep_pickup_datetime), avg(trip_distance/((unix_timestamp(tpep_dropoff_datetime) - unix_timestamp(tpep_pickup_datetime))/60)) as speed  
+from taxi 
+where ((unix_timestamp(tpep_dropoff_datetime) - unix_timestamp(tpep_pickup_datetime))/60) > 0 
+group by to_date(tpep_pickup_datetime) SORT BY speed
+-- The overall average speed is 0.21 miles/min
+-- The highest average speed is for the Christmas Day(25-dec) - 0.28 miles/min
+-- Days around Christmas Day also shows very high average speed (23-Dec : 0.23 miles/min, 24-Dec : 0.25 miles/min, 26-Dec : 0.23 miles/min)
+-- The second highest average speed is for Thanksgiving day(23-Nov) - 0.27 miles/min
+-- Days after Thanksgiving Day also shows very high average speed (24-Nov : 0.23 miles/min, 25-Nov : 0.25 miles/min, 26-Nov : 0.27 miles/min, 27-Nov : 0.23 miles/min)
+-- We can see the average high speed for the days(5-Nov, 6-Nov) as (0.25 miles/min and 0.22 miles/min) - This are the days before Election day in New york
+-- New Years Eve also saw Average high speed of 0.23 miles/min
+-- Days before New Year's day also shows avg high speed as (29-Dec : 0.23 miles/min, 30-Dec : 0.24 miles/min)
+-- # Besides holidays, a new pattenr can be seen i.e. From top 20 avergae speed and sxcluding special events, 
+-- We can see very high average speed for the dates (12-Nov, 19-Nov, 03-Dec, 10-Dec, 17-Dec) as (0.25, 0.24, 0.24, 0.25, 0.23 respectively)miles/min
+-- These all dates are of Sundays from which we can infer that Sundays shows average higher speed than other weekdays
